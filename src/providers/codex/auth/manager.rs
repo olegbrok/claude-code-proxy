@@ -1,5 +1,5 @@
-use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex, TryLockError};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use super::constants::{CLIENT_ID, ISSUER, REFRESH_MARGIN_MS};
 use super::jwt::{TokenResponse, extract_account_id, validate_token_response};
@@ -17,14 +17,20 @@ pub struct CodexAuthManager<S: AuthStorage<StoredAuth>> {
     // Observed in production as minutes-long all-requests-401 windows during
     // agent fan-outs at token-expiry boundaries.
     refresh_flight: Arc<Mutex<()>>,
+    token_endpoint: String,
 }
 
 impl<S: AuthStorage<StoredAuth>> CodexAuthManager<S> {
     pub fn new(store: CodexTokenStore<S>) -> Self {
+        Self::with_token_endpoint(store, format!("{ISSUER}/oauth/token"))
+    }
+
+    fn with_token_endpoint(store: CodexTokenStore<S>, token_endpoint: String) -> Self {
         Self {
             store,
             cached: Arc::new(Mutex::new(None)),
             refresh_flight: Arc::new(Mutex::new(())),
+            token_endpoint,
         }
     }
 
@@ -64,49 +70,73 @@ impl<S: AuthStorage<StoredAuth>> CodexAuthManager<S> {
         self.refresh_now(&stored)
     }
 
-    pub fn force_refresh(&self) -> Result<StoredAuth, anyhow::Error> {
-        let stored = {
-            let guard = self.cached.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
-            guard.clone()
-        };
-        let stored = match stored {
-            Some(auth) => auth,
-            None => {
-                let loaded = self.store.load_auth()?;
-                loaded.ok_or_else(|| anyhow::anyhow!("Not authenticated"))?
-            }
-        };
-        self.refresh_now(&stored)
+    pub fn force_refresh(&self, rejected: &StoredAuth) -> Result<StoredAuth, anyhow::Error> {
+        self.refresh_now(rejected)
     }
 
-    fn refresh_now(&self, current: &StoredAuth) -> Result<StoredAuth, anyhow::Error> {
+    fn refresh_now(&self, snapshot: &StoredAuth) -> Result<StoredAuth, anyhow::Error> {
         // Single-flight: hold the flight lock for the whole refresh. Racing
         // callers block here, then discover the winner's tokens on re-check
         // below and return without touching the token endpoint.
-        let _flight = self
-            .refresh_flight
-            .lock()
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let wait_started = Instant::now();
+        let (_flight, waited_for_flight) = match self.refresh_flight.try_lock() {
+            Ok(guard) => (guard, false),
+            Err(TryLockError::WouldBlock) => {
+                tracing::info!(
+                    provider = "codex",
+                    event = "auth_refresh_wait",
+                    "waiting for in-flight token refresh"
+                );
+                let guard = self
+                    .refresh_flight
+                    .lock()
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                tracing::info!(
+                    provider = "codex",
+                    event = "auth_refresh_wait_complete",
+                    wait_ms = wait_started.elapsed().as_millis() as u64,
+                    "acquired token refresh flight after waiting"
+                );
+                (guard, true)
+            }
+            Err(TryLockError::Poisoned(e)) => return Err(anyhow::anyhow!("{e}")),
+        };
 
         // Re-check under the lock: a concurrent flight (or another process
-        // sharing the store) may have refreshed while we waited. The store is
-        // the persisted truth; prefer it over both `current` and the cache.
+        // sharing the store) may have refreshed while we waited. Reuse only
+        // when persisted auth CHANGED from this caller's pre-wait snapshot.
+        // Freshness alone is insufficient: force_refresh() is entered because
+        // upstream rejected a token that may still have a future expiry.
         let current = match self.store.load_auth()? {
             Some(latest) => {
-                if latest.expires > Self::now_ms() + REFRESH_MARGIN_MS {
+                if token_identity_changed(&latest, snapshot)
+                    && latest.expires > Self::now_ms() + REFRESH_MARGIN_MS
+                {
                     let mut guard = self.cached.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
                     *guard = Some(latest.clone());
+                    tracing::info!(
+                        provider = "codex",
+                        event = "auth_refresh_reuse",
+                        waited_for_flight,
+                        "reusing persisted token rotated by another refresh flight"
+                    );
                     return Ok(latest);
                 }
                 latest
             }
-            None => current.clone(),
+            None => snapshot.clone(),
         };
 
         if current.refresh.is_empty() {
             anyhow::bail!("No refresh token stored; re-authenticate");
         }
 
+        tracing::info!(
+            provider = "codex",
+            event = "auth_refresh_start",
+            waited_for_flight,
+            "starting token refresh request"
+        );
         let client = reqwest::blocking::Client::new();
         let form = [
             ("client_id", CLIENT_ID.to_string()),
@@ -115,7 +145,7 @@ impl<S: AuthStorage<StoredAuth>> CodexAuthManager<S> {
         ];
 
         let resp = client
-            .post(format!("{ISSUER}/oauth/token"))
+            .post(&self.token_endpoint)
             .form(&form)
             .send()
             .map_err(|e| anyhow::anyhow!("refresh network error: {e}"))?;
@@ -126,12 +156,18 @@ impl<S: AuthStorage<StoredAuth>> CodexAuthManager<S> {
             // rotated since we read `current`, a concurrent writer (e.g.
             // another process sharing the Keychain entry) beat us — its
             // tokens are good; return them instead of clobbering the store.
-            if let Ok(Some(latest)) = self.store.load_auth() {
-                if latest.refresh != current.refresh && latest.expires > Self::now_ms() {
-                    let mut guard = self.cached.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
-                    *guard = Some(latest.clone());
-                    return Ok(latest);
-                }
+            if let Ok(Some(latest)) = self.store.load_auth()
+                && token_identity_changed(&latest, &current)
+                && latest.expires > Self::now_ms()
+            {
+                let mut guard = self.cached.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+                *guard = Some(latest.clone());
+                tracing::info!(
+                    provider = "codex",
+                    event = "auth_refresh_reuse_after_unauthorized",
+                    "refresh lost a cross-process race; reusing persisted winner token"
+                );
+                return Ok(latest);
             }
             {
                 let mut guard = self.cached.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -165,6 +201,11 @@ impl<S: AuthStorage<StoredAuth>> CodexAuthManager<S> {
             let mut guard = self.cached.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
             *guard = Some(next.clone());
         }
+        tracing::info!(
+            provider = "codex",
+            event = "auth_refresh_complete",
+            "token refresh completed and persisted"
+        );
         Ok(next)
     }
 
@@ -202,10 +243,17 @@ impl<S: AuthStorage<StoredAuth>> CodexAuthManager<S> {
     }
 }
 
+fn token_identity_changed(latest: &StoredAuth, snapshot: &StoredAuth) -> bool {
+    latest.access != snapshot.access || latest.refresh != snapshot.refresh
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::auth::InMemoryAuthStore;
+    use crate::providers::codex::auth::test_http;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc as StdArc, Barrier};
 
     fn test_store() -> CodexTokenStore<InMemoryAuthStore<StoredAuth>> {
         CodexTokenStore::new(InMemoryAuthStore::new())
@@ -269,8 +317,48 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_get_auth_single_flights_to_rotated_tokens() {
-        use std::sync::Arc as StdArc;
+    fn forced_refresh_reuses_token_rotated_since_rejected_snapshot() {
+        // This is the cross-process / late-waiter case: persisted auth changed
+        // after this caller sent its request. Reuse it without a second
+        // rotation (the production endpoint would fail this test if reached).
+        let store = test_store();
+        let rotated = StoredAuth {
+            access: "rotated_access".into(),
+            refresh: "rotated_refresh".into(),
+            expires: 9_999_999_999_999,
+            account_id: Some("acct_1".into()),
+        };
+        store.save_auth(rotated.clone()).unwrap();
+        let manager = CodexAuthManager::new(store);
+        let rejected = StoredAuth {
+            access: "rejected_access".into(),
+            refresh: "rejected_refresh".into(),
+            expires: 9_999_999_999_999,
+            account_id: Some("acct_1".into()),
+        };
+
+        let result = manager.force_refresh(&rejected).unwrap();
+        assert_eq!(result, rotated);
+    }
+
+    #[test]
+    fn token_identity_ignores_expiry_and_account_metadata() {
+        let first = StoredAuth {
+            access: "access".into(),
+            refresh: "refresh".into(),
+            expires: 1,
+            account_id: None,
+        };
+        let metadata_only = StoredAuth {
+            expires: 9_999_999_999_999,
+            account_id: Some("acct_1".into()),
+            ..first.clone()
+        };
+        assert!(!token_identity_changed(&metadata_only, &first));
+    }
+
+    #[test]
+    fn concurrent_get_auth_reuses_rotated_persisted_tokens() {
         let store = test_store();
         store
             .save_auth(StoredAuth {
@@ -295,5 +383,67 @@ mod tests {
         for h in handles {
             assert_eq!(h.join().unwrap(), "rotated_access");
         }
+    }
+
+    #[test]
+    fn concurrent_forced_refresh_single_flights_one_real_rotation() {
+        const CALLERS: usize = 8;
+        let refresh_requests = StdArc::new(AtomicUsize::new(0));
+        let request_counter = StdArc::clone(&refresh_requests);
+        let server = test_http::spawn_mock_server(
+            "mock refresh server should become ready",
+            move |request| {
+                assert!(request.starts_with("POST /oauth/token "));
+                assert!(request.contains("refresh_token=initial_refresh"));
+                request_counter.fetch_add(1, Ordering::SeqCst);
+                // Keep the winner in flight long enough for every other
+                // caller to queue behind the shared mutex deterministically.
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                test_http::json_response(
+                    200,
+                    r#"{"access_token":"rotated_access","refresh_token":"rotated_refresh","expires_in":3600}"#,
+                )
+            },
+        );
+
+        let store = test_store();
+        let rejected = StoredAuth {
+            access: "rejected_access".into(),
+            refresh: "initial_refresh".into(),
+            // Deliberately fresh: a forced refresh must not short-circuit on
+            // expiry alone after upstream has rejected this exact token.
+            expires: 9_999_999_999_999,
+            account_id: Some("acct_1".into()),
+        };
+        store.save_auth(rejected.clone()).unwrap();
+        let manager = StdArc::new(CodexAuthManager::with_token_endpoint(
+            store,
+            format!("{}/oauth/token", server.url),
+        ));
+        manager.set_cached(rejected.clone());
+
+        let barrier = StdArc::new(Barrier::new(CALLERS + 1));
+        let mut handles = Vec::new();
+        for _ in 0..CALLERS {
+            let manager = StdArc::clone(&manager);
+            let barrier = StdArc::clone(&barrier);
+            let rejected = rejected.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                manager.force_refresh(&rejected).unwrap()
+            }));
+        }
+        barrier.wait();
+
+        for handle in handles {
+            let auth = handle.join().unwrap();
+            assert_eq!(auth.access, "rotated_access");
+            assert_eq!(auth.refresh, "rotated_refresh");
+        }
+        assert_eq!(refresh_requests.load(Ordering::SeqCst), 1);
+
+        let persisted = manager.store.load_auth().unwrap().unwrap();
+        assert_eq!(persisted.access, "rotated_access");
+        assert_eq!(persisted.refresh, "rotated_refresh");
     }
 }

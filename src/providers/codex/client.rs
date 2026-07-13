@@ -372,7 +372,10 @@ impl CodexHttpClient {
             };
 
             if should_refresh_after_unauthorized(&result, transport_attempt) {
-                match self.auth_manager.force_refresh() {
+                // Pass the auth snapshot that this request actually used.
+                // A shared manager may already hold a newer winner token by
+                // the time this request reaches its 401 retry path.
+                match self.auth_manager.force_refresh(&auth) {
                     Ok(new_auth) => {
                         auth = new_auth;
                         continue;
