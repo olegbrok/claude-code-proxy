@@ -915,6 +915,13 @@ mod tests {
             out.tool_choice,
             Some(ResponsesToolChoice::WebSearch { .. })
         ));
+        let Some(ResponsesTool::WebSearch(web_search)) =
+            out.tools.as_ref().and_then(|tools| tools.first())
+        else {
+            panic!("expected translated web_search tool");
+        };
+        assert!(web_search.external_web_access);
+        assert!(web_search.filters.is_none());
     }
 
     #[test]

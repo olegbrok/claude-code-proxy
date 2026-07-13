@@ -46,7 +46,14 @@ use self::translate::stream::translate_stream_bytes_with_traffic;
 // Provider
 // ---------------------------------------------------------------------------
 
-pub struct CodexProvider;
+pub struct CodexProvider {
+    // One client per registered provider means one CodexAuthManager and one
+    // refresh single-flight lock for every request handled by this proxy.
+    // Constructing the client inside handle_messages made the lock request-
+    // scoped, so concurrent Claude Code subprocesses could all rotate the
+    // same single-use refresh token independently.
+    client: Arc<CodexHttpClient>,
+}
 
 impl Default for CodexProvider {
     fn default() -> Self {
@@ -56,7 +63,13 @@ impl Default for CodexProvider {
 
 impl CodexProvider {
     pub fn new() -> Self {
-        Self
+        Self {
+            client: Arc::new(CodexHttpClient::new()),
+        }
+    }
+
+    fn client(&self) -> Arc<CodexHttpClient> {
+        Arc::clone(&self.client)
     }
 }
 
@@ -132,7 +145,7 @@ impl Provider for CodexProvider {
         );
 
         // Post to upstream with continuation
-        let client = Arc::new(CodexHttpClient::new());
+        let client = self.client();
         if let Some(monitor) = ctx.monitor.as_ref() {
             monitor.upstream_started(&ctx.req_id);
         }
@@ -1011,6 +1024,14 @@ mod tests {
         assert!(models.contains(&"gpt-5.6-luna".to_string()));
         assert!(models.contains(&"gpt-5.4".to_string()));
         assert!(models.contains(&"gpt-5.4-mini".to_string()));
+    }
+
+    #[test]
+    fn provider_reuses_one_codex_client_for_all_requests() {
+        let provider = CodexProvider::new();
+        let first = provider.client();
+        let second = provider.client();
+        assert!(Arc::ptr_eq(&first, &second));
     }
 
     #[test]
