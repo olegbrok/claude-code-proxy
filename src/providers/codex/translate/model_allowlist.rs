@@ -16,13 +16,17 @@ pub const ALLOWED_MODELS: &[&str] = &[
     "gpt-5.6-terra",
 ];
 
+// 2026-07-12: terra/luna entitlement FLAPS on this account (windows where
+// the backend 401s them while sol stays up — verified with sequential
+// single-request probes during a window: sonnet->terra 16/16 fail while
+// sol 8/8 pass). Map every alias to sol, the one reliably entitled model.
 pub const MODEL_ALIASES: &[(&str, &str)] = &[
-    ("haiku", "gpt-5.6-luna"),
-    ("claude-haiku-4-5", "gpt-5.6-luna"),
-    ("claude-haiku-4-5-20251001", "gpt-5.6-luna"),
-    ("sonnet", "gpt-5.6-terra"),
-    ("claude-sonnet-4-6", "gpt-5.6-terra"),
-    ("claude-sonnet-5", "gpt-5.6-terra"),
+    ("haiku", "gpt-5.6-sol"),
+    ("claude-haiku-4-5", "gpt-5.6-sol"),
+    ("claude-haiku-4-5-20251001", "gpt-5.6-sol"),
+    ("sonnet", "gpt-5.6-sol"),
+    ("claude-sonnet-4-6", "gpt-5.6-sol"),
+    ("claude-sonnet-5", "gpt-5.6-sol"),
     ("opus", "gpt-5.6-sol"),
     ("claude-opus-4-7", "gpt-5.6-sol"),
     ("claude-opus-4-8", "gpt-5.6-sol"),
@@ -140,9 +144,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn haiku_resolves_to_luna() {
+    fn haiku_resolves_to_sol() {
         let r = resolve_model_request("haiku");
-        assert_eq!(r.model, "gpt-5.6-luna");
+        assert_eq!(r.model, "gpt-5.6-sol");
     }
 
     #[test]
@@ -154,15 +158,15 @@ mod tests {
     }
 
     #[test]
-    fn sonnet_resolves_to_terra() {
+    fn sonnet_resolves_to_sol() {
         let r = resolve_model_request("sonnet");
-        assert_eq!(r.model, "gpt-5.6-terra");
+        assert_eq!(r.model, "gpt-5.6-sol");
     }
 
     #[test]
-    fn sonnet_5_resolves_to_terra() {
+    fn sonnet_5_resolves_to_sol() {
         let r = resolve_model_request("claude-sonnet-5");
-        assert_eq!(r.model, "gpt-5.6-terra");
+        assert_eq!(r.model, "gpt-5.6-sol");
     }
 
     #[test]
